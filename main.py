@@ -61,12 +61,14 @@ RSI_SELL_THRESHOLD = 55.0
 # MARKET DATA FETCHING
 # ==========================================
 async def fetch_market_data(symbol: str, mode: str):
-    """Fetches real live ticker prices and calculates real-time RSI from Bitget API."""
+    """Fetches real live ticker prices and calculates RSI from Bitget public API."""
     try:
-        # Format symbol for Bitget API (e.g. SOL/USDT -> SOLUSDT)
         clean_symbol = symbol.replace("/", "")
+        headers = {"User-Agent": "Mozilla/5.0"}
 
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with httpx.AsyncClient(
+            timeout=10.0, headers=headers
+        ) as client:
             # 1. Fetch Real-Time Ticker Price
             ticker_url = f"https://api.bitget.com/api/v2/spot/market/tickers?symbol={clean_symbol}"
             ticker_res = await client.get(ticker_url)
@@ -80,14 +82,14 @@ async def fetch_market_data(symbol: str, mode: str):
 
             live_price = float(ticker_data["data"][0]["lastPr"])
 
-            # 2. Fetch Recent 15m Candlestick Data for RSI
-            kline_url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={clean_symbol}&granularity=15m&limit=30"
+            # 2. Fetch Recent 15m Candlesticks for RSI (productType=SPOT required)
+            kline_url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={clean_symbol}&granularity=15m&limit=30&productType=SPOT"
             kline_res = await client.get(kline_url)
             kline_data = kline_res.json()
 
             if kline_data.get("code") == "00000" and kline_data.get("data"):
                 closes = [float(candle[4]) for candle in kline_data["data"]]
-                closes.reverse()  # Chronological order
+                closes.reverse()
 
                 # Calculate 14-period RSI
                 df = pd.DataFrame({"close": closes})
