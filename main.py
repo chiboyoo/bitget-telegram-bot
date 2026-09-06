@@ -22,19 +22,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# VALIDATED TELEGRAM BOT TOKEN
 BOT_TOKEN = "7739259104:AAEKKWPy2LZfCQC1Lm6lOEpQJ_cVXPEfU4c"
 
-# User session settings
+# User session settings & simulated paper balance
 USER_SETTINGS = {
-    "TRADING_MODE": "DEMO",  # "DEMO" or "LIVE"
+    "TRADING_MODE": "DEMO",
     "ALLOCATION_PER_ORDER": 100.0,
     "WATCHLIST": ["SOL/USDT", "BTC/USDT", "ETH/USDT"],
     "WAITING_FOR_AMOUNT": False,
     "WAITING_FOR_CUSTOM_PAIR": False,
+    "BALANCE": 1000.00,
+    "REALIZED_PNL": 0.00,
+    "OPEN_POSITIONS": {
+        "SOL/USDT": {"amount": 100.0, "entry_price": 98.50},
+        "BTC/USDT": {"amount": 100.0, "entry_price": 78200.00},
+    }
 }
 
-# Available popular pairs for one-click toggle
 AVAILABLE_PAIRS = [
     "SOL/USDT", "BTC/USDT", "ETH/USDT", 
     "XRP/USDT", "DOGE/USDT", "BNB/USDT", 
@@ -46,14 +50,13 @@ RSI_SELL_THRESHOLD = 55.0
 
 
 # ==========================================
-# MARKET DATA FETCHING (DEMO VS LIVE)
+# MARKET DATA FETCHING
 # ==========================================
 async def fetch_market_data(symbol: str, mode: str):
-    """Fetches market indicators based on selected mode (DEMO or LIVE)."""
     try:
         if mode == "LIVE":
             await asyncio.sleep(0.4)
-            return {"price": 102.50, "rsi": 43.8, "mode": "LIVE (Real Market)"}
+            return {"price": 102.50, "rsi": 43.8, "mode": "LIVE"}
         else:
             mock_prices = {
                 "SOL/USDT": {"price": 101.20, "rsi": 42.5},
@@ -68,10 +71,10 @@ async def fetch_market_data(symbol: str, mode: str):
             }
             await asyncio.sleep(0.2)
             res = mock_prices.get(symbol, {"price": 10.0, "rsi": 46.0})
-            res["mode"] = "DEMO (Paper)"
+            res["mode"] = "DEMO"
             return res
     except Exception as e:
-        logger.error(f"Error fetching data for {symbol} in {mode} mode: {e}")
+        logger.error(f"Error fetching data for {symbol}: {e}")
         return None
 
 
@@ -91,21 +94,23 @@ def get_main_keyboard():
     keyboard = [
         [InlineKeyboardButton(f"Mode: {mode_label} (Click to Switch)", callback_data="switch_mode")],
         [
-            InlineKeyboardButton("🎯 Manage Watchlist / Pairs", callback_data="manage_watchlist"),
-            InlineKeyboardButton("💵 Set Allocation", callback_data="trigger_set_amount"),
+            InlineKeyboardButton("🎯 Watchlist", callback_data="manage_watchlist"),
+            InlineKeyboardButton("💵 Allocation", callback_data="trigger_set_amount"),
         ],
         [
-            InlineKeyboardButton("📊 Check Market Signals", callback_data="check_market"),
-            InlineKeyboardButton("⚙️ Bot Status", callback_data="bot_status"),
+            InlineKeyboardButton("📊 Market Signals", callback_data="check_market"),
+            InlineKeyboardButton("📈 Check Profit / PnL", callback_data="check_pnl"),
         ],
-        [InlineKeyboardButton("📖 Strategy Rules", callback_data="strategy_rules")],
+        [
+            InlineKeyboardButton("⚙️ Bot Status", callback_data="bot_status"),
+            InlineKeyboardButton("📖 Strategy Rules", callback_data="strategy_rules"),
+        ]
     ]
     return InlineKeyboardMarkup(keyboard)
 
 
 def get_watchlist_keyboard():
     keyboard = []
-    # Create toggle buttons for available pairs
     for i in range(0, len(AVAILABLE_PAIRS), 2):
         row = []
         for pair in AVAILABLE_PAIRS[i:i+2]:
@@ -114,7 +119,7 @@ def get_watchlist_keyboard():
             row.append(InlineKeyboardButton(label, callback_data=f"toggle_pair_{pair}"))
         keyboard.append(row)
     
-    keyboard.append([InlineKeyboardButton("➕ Add Custom Pair (e.g. PEPE/USDT)", callback_data="add_custom_pair")])
+    keyboard.append([InlineKeyboardButton("➕ Add Custom Pair", callback_data="add_custom_pair")])
     keyboard.append([InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(keyboard)
 
@@ -125,10 +130,7 @@ def get_watchlist_keyboard():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_SETTINGS["WAITING_FOR_AMOUNT"] = False
     USER_SETTINGS["WAITING_FOR_CUSTOM_PAIR"] = False
-    welcome_text = (
-        "🤖 **Bitget Autonomous Trading Bot**\n\n"
-        "**Step 1:** Select your execution environment:"
-    )
+    welcome_text = "🤖 **Bitget Autonomous Trading Bot**\n\n**Step 1:** Select execution mode:"
     if update.message:
         await update.message.reply_text(welcome_text, reply_markup=get_mode_keyboard(), parse_mode="Markdown")
     elif update.callback_query:
@@ -146,14 +148,12 @@ async def mode_selection_callback(update: Update, context: ContextTypes.DEFAULT_
     icon = "🟢" if mode == "DEMO" else "🔴"
     prompt_text = (
         f"{icon} Mode set to **{mode}**.\n\n"
-        "**Step 2:** Enter order allocation in USDT:\n"
-        "*(Type a number in chat, e.g., 50, 100, or 500)*"
+        "**Step 2:** Enter trade size in USDT (e.g. 100):"
     )
     await query.message.reply_text(prompt_text, parse_mode="Markdown")
 
 
 async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Process custom pair input
     if USER_SETTINGS.get("WAITING_FOR_CUSTOM_PAIR"):
         raw_pair = update.message.text.strip().upper()
         if "/" not in raw_pair:
@@ -163,15 +163,14 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             USER_SETTINGS["WATCHLIST"].append(raw_pair)
             if raw_pair not in AVAILABLE_PAIRS:
                 AVAILABLE_PAIRS.append(raw_pair)
-            msg = f"✅ Added **{raw_pair}** to your trading watchlist!"
+            msg = f"✅ Added **{raw_pair}** to watchlist!"
         else:
-            msg = f"⚠️ **{raw_pair}** is already in your watchlist."
+            msg = f"⚠️ **{raw_pair}** is already in watchlist."
             
         USER_SETTINGS["WAITING_FOR_CUSTOM_PAIR"] = False
         await update.message.reply_text(msg, reply_markup=get_watchlist_keyboard(), parse_mode="Markdown")
         return
 
-    # Process allocation input
     if USER_SETTINGS.get("WAITING_FOR_AMOUNT"):
         text = update.message.text.strip().replace("$", "")
         try:
@@ -182,66 +181,89 @@ async def text_input_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             USER_SETTINGS["ALLOCATION_PER_ORDER"] = amount
             USER_SETTINGS["WAITING_FOR_AMOUNT"] = False
 
-            mode = USER_SETTINGS["TRADING_MODE"]
             summary = (
-                "🎉 **Setup Complete! Bot Activated.**\n\n"
-                f"• **Trading Mode**: {mode}\n"
-                f"• **Order Size**: ${amount:,.2f} USDT\n"
-                f"• **Active Pairs**: {', '.join(USER_SETTINGS['WATCHLIST'])}\n"
-                f"• **Buy Trigger**: RSI < {RSI_BUY_THRESHOLD}"
+                "🎉 **Setup Complete!**\n\n"
+                f"• Mode: {USER_SETTINGS['TRADING_MODE']}\n"
+                f"• Allocation: ${amount:,.2f} USDT\n"
+                f"• Pairs: {', '.join(USER_SETTINGS['WATCHLIST'])}"
             )
             await update.message.reply_text(summary, reply_markup=get_main_keyboard(), parse_mode="Markdown")
         except ValueError:
-            await update.message.reply_text("⚠️ Invalid input. Please enter a valid number (e.g. 100):")
+            await update.message.reply_text("⚠️ Enter a valid number (e.g. 100):")
+
+
+async def check_pnl_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer("Calculating PnL...")
+
+    mode = USER_SETTINGS["TRADING_MODE"]
+    positions = USER_SETTINGS["OPEN_POSITIONS"]
+    
+    total_unrealized_pnl = 0.0
+    pnl_lines = ["📈 **PROFIT & LOSS (PnL) REPORT**", f"Mode: **{mode}**\n"]
+
+    if not positions:
+        pnl_lines.append("ℹ️ No active open positions.")
+    else:
+        for pair, pos in positions.items():
+            m_data = await fetch_market_data(pair, mode)
+            if m_data:
+                curr_price = m_data["price"]
+                entry_price = pos["entry_price"]
+                alloc = pos["amount"]
+                
+                # Percentage change
+                pnl_pct = ((curr_price - entry_price) / entry_price) * 100
+                pnl_usdt = (pnl_pct / 100) * alloc
+                total_unrealized_pnl += pnl_usdt
+
+                icon = "🟢" if pnl_usdt >= 0 else "🔴"
+                pnl_lines.append(
+                    f"• **{pair}**: {icon} **{pnl_pct:+.2f}%** (${pnl_usdt:+.2f} USDT)\n"
+                    f"  └ Entry: ${entry_price:,.2f} | Current: ${curr_price:,.2f}"
+                )
+
+    total_icon = "🚀" if total_unrealized_pnl >= 0 else "🔻"
+    pnl_lines.append(f"\n{total_icon} **Unrealized PnL**: **${total_unrealized_pnl:+.2f} USDT**")
+    pnl_lines.append(f"💰 **Realized Profit**: **${USER_SETTINGS['REALIZED_PNL']:+.2f} USDT**")
+
+    await query.message.reply_text("\n".join(pnl_lines), reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 
 async def check_market_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer("Fetching market analysis...")
+    await query.answer("Fetching signals...")
 
     if not USER_SETTINGS["WATCHLIST"]:
-        await query.message.reply_text("⚠️ Your watchlist is empty! Click **Manage Watchlist** to add trading pairs.", reply_markup=get_main_keyboard())
+        await query.message.reply_text("⚠️ Watchlist is empty!", reply_markup=get_main_keyboard())
         return
 
     mode = USER_SETTINGS["TRADING_MODE"]
-    status_msg = await query.message.reply_text(f"⏳ Fetching market indicators ({mode} Mode)...")
+    status_msg = await query.message.reply_text(f"⏳ Fetching indicators ({mode} Mode)...")
 
     try:
-        lines = ["📊 **MULTI-ASSET ANALYSIS**", f"Execution Mode: **{mode}**\n"]
-
+        lines = ["📊 **MARKET ANALYSIS**\n"]
         for pair in USER_SETTINGS["WATCHLIST"]:
             data = await fetch_market_data(pair, mode)
             if data:
-                price = data["price"]
                 rsi = data["rsi"]
-
-                if rsi < RSI_BUY_THRESHOLD:
-                    signal = f"🟢 **BUY SIGNAL** (RSI < {RSI_BUY_THRESHOLD})"
-                elif rsi > RSI_SELL_THRESHOLD:
-                    signal = f"🔴 **SELL / TAKE PROFIT** (RSI > {RSI_SELL_THRESHOLD})"
-                else:
-                    signal = "⚪ Holding / Neutral"
-
-                lines.append(f"• **{pair}**: ${price:,.2f} | RSI: {rsi:.1f}\n  └ Signal: {signal}")
+                signal = "🟢 BUY" if rsi < RSI_BUY_THRESHOLD else ("🔴 SELL" if rsi > RSI_SELL_THRESHOLD else "⚪ Hold")
+                lines.append(f"• **{pair}**: ${data['price']:,.2f} | RSI: {rsi:.1f} ({signal})")
             else:
-                lines.append(f"• **{pair}**: ⚠️ Data unavailable")
+                lines.append(f"• **{pair}**: ⚠️ Error")
 
-        lines.append(f"\n💡 *Allocation: ${USER_SETTINGS['ALLOCATION_PER_ORDER']:.2f} USDT per trade*")
         await status_msg.edit_text("\n".join(lines), reply_markup=get_main_keyboard(), parse_mode="Markdown")
     except Exception as e:
         logger.error(f"Error in check_market: {e}")
-        traceback.print_exc()
-        await status_msg.edit_text("⚠️ Temporary network timeout fetching market data. Please try again.", reply_markup=get_main_keyboard())
+        await status_msg.edit_text("⚠️ Network timeout fetching data.", reply_markup=get_main_keyboard())
 
 
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
+
     if data == "main_menu":
-        USER_SETTINGS["WAITING_FOR_CUSTOM_PAIR"] = False
-        USER_SETTINGS["WAITING_FOR_AMOUNT"] = False
         await query.message.reply_text("🤖 **Main Control Panel**", reply_markup=get_main_keyboard())
 
     elif data == "switch_mode":
@@ -249,8 +271,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "manage_watchlist":
         pairs_str = ", ".join(USER_SETTINGS["WATCHLIST"]) if USER_SETTINGS["WATCHLIST"] else "None"
-        text = f"🎯 **MANAGE TRADING PAIRS**\n\nCurrently Active: **{pairs_str}**\n\nTap a pair below to toggle it on or off:"
-        await query.message.reply_text(text, reply_markup=get_watchlist_keyboard(), parse_mode="Markdown")
+        await query.message.reply_text(f"🎯 **WATCHLIST**\nActive: **{pairs_str}**", reply_markup=get_watchlist_keyboard(), parse_mode="Markdown")
 
     elif data.startswith("toggle_pair_"):
         pair = data.replace("toggle_pair_", "")
@@ -258,41 +279,28 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             USER_SETTINGS["WATCHLIST"].remove(pair)
         else:
             USER_SETTINGS["WATCHLIST"].append(pair)
-        
         pairs_str = ", ".join(USER_SETTINGS["WATCHLIST"]) if USER_SETTINGS["WATCHLIST"] else "None"
-        text = f"🎯 **MANAGE TRADING PAIRS**\n\nCurrently Active: **{pairs_str}**\n\nTap a pair below to toggle it on or off:"
-        await query.message.edit_text(text, reply_markup=get_watchlist_keyboard(), parse_mode="Markdown")
+        await query.message.edit_text(f"🎯 **WATCHLIST**\nActive: **{pairs_str}**", reply_markup=get_watchlist_keyboard(), parse_mode="Markdown")
 
     elif data == "add_custom_pair":
         USER_SETTINGS["WAITING_FOR_CUSTOM_PAIR"] = True
-        await query.message.reply_text("✏️ **Type the ticker pair you want to add** (e.g., `PEPE/USDT` or `SUI`):", parse_mode="Markdown")
+        await query.message.reply_text("✏️ Enter pair ticker (e.g., `PEPE/USDT`):", parse_mode="Markdown")
 
     elif data == "trigger_set_amount":
         USER_SETTINGS["WAITING_FOR_AMOUNT"] = True
-        await query.message.reply_text("Type your new trade allocation in USDT (e.g. 200):")
+        await query.message.reply_text("Enter allocation amount in USDT:")
 
     elif data == "bot_status":
-        mode = USER_SETTINGS["TRADING_MODE"]
-        pairs_str = ", ".join(USER_SETTINGS["WATCHLIST"]) if USER_SETTINGS["WATCHLIST"] else "None"
         status_text = (
             "⚙️ **BOT STATUS**\n"
-            "───────────────\n"
-            "State: Active 🟢\n"
-            f"Mode: {mode}\n"
-            f"Watchlist: {pairs_str}\n"
+            f"Mode: {USER_SETTINGS['TRADING_MODE']}\n"
             f"Allocation: ${USER_SETTINGS['ALLOCATION_PER_ORDER']:.2f} USDT\n"
-            f"Buy Trigger: RSI < {RSI_BUY_THRESHOLD}\n"
-            f"Sell Trigger: RSI > {RSI_SELL_THRESHOLD}"
+            f"Watchlist: {', '.join(USER_SETTINGS['WATCHLIST']) if USER_SETTINGS['WATCHLIST'] else 'None'}"
         )
         await query.message.reply_text(status_text, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
     elif data == "strategy_rules":
-        rules = (
-            "📖 **STRATEGY RULES**\n\n"
-            f"1. **Buy Trigger**: RSI drops below {RSI_BUY_THRESHOLD}.\n"
-            f"2. **Sell Trigger**: RSI rises above {RSI_SELL_THRESHOLD}.\n"
-            f"3. **Order Size**: ${USER_SETTINGS['ALLOCATION_PER_ORDER']:.2f} USDT per position."
-        )
+        rules = f"📖 **RULES**\n1. Buy: RSI < {RSI_BUY_THRESHOLD}\n2. Sell: RSI > {RSI_SELL_THRESHOLD}"
         await query.message.reply_text(rules, reply_markup=get_main_keyboard(), parse_mode="Markdown")
 
 
@@ -300,17 +308,12 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # MAIN INITIALIZATION
 # ==========================================
 def main():
-    request = HTTPXRequest(
-        connect_timeout=30.0,
-        read_timeout=30.0,
-        write_timeout=30.0,
-        pool_timeout=30.0,
-    )
-
+    request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
     app = ApplicationBuilder().token(BOT_TOKEN).request(request).build()
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CallbackQueryHandler(mode_selection_callback, pattern="^set_mode_(demo|live)$"))
+    app.add_handler(CallbackQueryHandler(check_pnl_callback, pattern="^check_pnl$"))
     app.add_handler(CallbackQueryHandler(check_market_callback, pattern="^check_market$"))
     app.add_handler(CallbackQueryHandler(button_router))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler))
@@ -321,4 +324,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-        
+                
