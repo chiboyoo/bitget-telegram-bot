@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import traceback
+import httpx
+import pandas as pd
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -59,29 +61,54 @@ RSI_SELL_THRESHOLD = 55.0
 # MARKET DATA FETCHING
 # ==========================================
 async def fetch_market_data(symbol: str, mode: str):
+    """Fetches real live ticker prices and calculates real-time RSI from Bitget API."""
     try:
-        if mode == "LIVE":
-            await asyncio.sleep(0.4)
-            return {"price": 102.50, "rsi": 43.8, "mode": "LIVE"}
-        else:
-            mock_prices = {
-                "SOL/USDT": {"price": 101.20, "rsi": 42.5},
-                "BTC/USDT": {"price": 79500.00, "rsi": 44.1},
-                "ETH/USDT": {"price": 2450.00, "rsi": 48.0},
-                "XRP/USDT": {"price": 0.55, "rsi": 38.2},
-                "DOGE/USDT": {"price": 0.12, "rsi": 56.4},
-                "BNB/USDT": {"price": 580.00, "rsi": 49.0},
-                "AVAX/USDT": {"price": 28.50, "rsi": 41.0},
-                "LINK/USDT": {"price": 14.20, "rsi": 58.5},
-                "NEAR/USDT": {"price": 4.80, "rsi": 43.0},
-            }
-            await asyncio.sleep(0.2)
-            res = mock_prices.get(symbol, {"price": 10.0, "rsi": 46.0})
-            res["mode"] = "DEMO"
-            return res
+        # Format symbol for Bitget API (e.g. SOL/USDT -> SOLUSDT)
+        clean_symbol = symbol.replace("/", "")
+
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # 1. Fetch Real-Time Ticker Price
+            ticker_url = f"https://api.bitget.com/api/v2/spot/market/tickers?symbol={clean_symbol}"
+            ticker_res = await client.get(ticker_url)
+            ticker_data = ticker_res.json()
+
+            if (
+                ticker_data.get("code") != "00000"
+                or not ticker_data.get("data")
+            ):
+                return None
+
+            live_price = float(ticker_data["data"][0]["lastPr"])
+
+            # 2. Fetch Recent 15m Candlestick Data for RSI
+            kline_url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={clean_symbol}&granularity=15m&limit=30"
+            kline_res = await client.get(kline_url)
+            kline_data = kline_res.json()
+
+            if kline_data.get("code") == "00000" and kline_data.get("data"):
+                closes = [float(candle[4]) for candle in kline_data["data"]]
+                closes.reverse()  # Chronological order
+
+                # Calculate 14-period RSI
+                df = pd.DataFrame({"close": closes})
+                delta = df["close"].diff()
+                gain = delta.clip(lower=0)
+                loss = -1 * delta.clip(upper=0)
+                avg_gain = gain.rolling(window=14).mean()
+                avg_loss = loss.rolling(window=14).mean()
+
+                rs = avg_gain / avg_loss
+                rsi_series = 100 - (100 / (1 + rs))
+                current_rsi = float(rsi_series.iloc[-1])
+            else:
+                current_rsi = 50.0
+
+            return {"price": live_price, "rsi": round(current_rsi, 1)}
+
     except Exception as e:
-        logger.error(f"Error fetching data for {symbol}: {e}")
+        logger.error(f"Bitget API Error for {symbol}: {e}")
         return None
+        
 
 
 # ==========================================
