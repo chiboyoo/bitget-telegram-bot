@@ -1,7 +1,9 @@
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
-import os
-import traceback
+import time
 import httpx
 import pandas as pd
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -26,19 +28,27 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "7739259104:AAEKKWPy2LZfCQC1Lm6lOEpQJ_cVXPEfU4c"
 
-# User session settings & balances
+# API Credentials
+DEMO_API_KEY = "bg_4e1491afbd7a021134eef2e8d5c2c4c5"
+DEMO_SECRET_KEY = (
+    "b9dde440fa3492ed888ad325e4c6b9ee7e0856cf974c0caa9bba339a748e3f23"
+)
+
+LIVE_API_KEY = "bg_203aa8f162f1ab5302705d5711745dcc"
+LIVE_SECRET_KEY = (
+    "1ea94d15af0aa29174e3b712fbd6f97e5136fe344f8c1fadb5454497873b50df"
+)
+LIVE_PASSPHRASE = ""  # Add Bitget passphrase if your API key requires one
+
 USER_SETTINGS = {
     "TRADING_MODE": "DEMO",
     "ALLOCATION_PER_ORDER": 100.0,
     "WATCHLIST": ["SOL/USDT", "BTC/USDT", "ETH/USDT"],
     "WAITING_FOR_AMOUNT": False,
     "WAITING_FOR_CUSTOM_PAIR": False,
-    "BALANCE": 1000.00,  # Starting paper balance (USDT)
+    "DEMO_BALANCE": 1000.00,
     "REALIZED_PNL": 0.00,
-    "OPEN_POSITIONS": {
-        "SOL/USDT": {"amount": 100.0, "entry_price": 98.50},
-        "BTC/USDT": {"amount": 100.0, "entry_price": 78200.00},
-    },
+    "OPEN_POSITIONS": {},
 }
 
 AVAILABLE_PAIRS = [
@@ -58,18 +68,61 @@ RSI_SELL_THRESHOLD = 55.0
 
 
 # ==========================================
-# MARKET DATA FETCHING
+# BITGET API & SIGNATURE HELPERS
 # ==========================================
-async def fetch_market_data(symbol: str, mode: str):
-    """Fetches real live ticker prices and calculates RSI from Bitget public API."""
+def generate_signature(
+    timestamp: str, method: str, request_path: str, body: str, secret_key: str
+) -> str:
+    """Generates HMAC-SHA256 signature required for Bitget v2 private API."""
+    message = f"{timestamp}{method.upper()}{request_path}{body}"
+    mac = hmac.new(
+        secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
+    )
+    return base64.b64encode(mac.digest()).decode("utf-8")
+
+
+async def fetch_real_balance(mode: str):
+    """Fetches real available USDT balance from Bitget Account API."""
+    api_key = LIVE_API_KEY if mode == "LIVE" else DEMO_API_KEY
+    secret_key = LIVE_SECRET_KEY if mode == "LIVE" else DEMO_SECRET_KEY
+
+    request_path = "/api/v2/spot/account/assets"
+    timestamp = str(int(time.time() * 1000))
+    signature = generate_signature(timestamp, "GET", request_path, "", secret_key)
+
+    headers = {
+        "ACCESS-KEY": api_key,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": LIVE_PASSPHRASE,
+        "Content-Type": "application/json",
+        "User-Agent": "Mozilla/5.0",
+    }
+
     try:
-        clean_symbol = symbol.replace("/", "")
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            res = await client.get(
+                f"https://api.bitget.com{request_path}", headers=headers
+            )
+            data = res.json()
+            if data.get("code") == "00000" and data.get("data"):
+                for asset in data["data"]:
+                    if asset.get("coin") == "USDT":
+                        return float(asset.get("available", 0.0))
+            return 0.0
+    except Exception as e:
+        logger.error(f"Error fetching Bitget balance ({mode}): {e}")
+        return None
+
+
+async def fetch_market_data(symbol: str, mode: str):
+    """Fetches real-time price and 15m RSI for both Live and Demo modes."""
+    try:
+        clean_symbol = symbol.replace("/", "").upper()
         headers = {"User-Agent": "Mozilla/5.0"}
 
-        async with httpx.AsyncClient(
-            timeout=10.0, headers=headers
-        ) as client:
-            # 1. Fetch Real-Time Ticker Price
+        async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
+            # 1. Fetch Real-time Price Ticker
             ticker_url = f"https://api.bitget.com/api/v2/spot/market/tickers?symbol={clean_symbol}"
             ticker_res = await client.get(ticker_url)
             ticker_data = ticker_res.json()
@@ -82,8 +135,8 @@ async def fetch_market_data(symbol: str, mode: str):
 
             live_price = float(ticker_data["data"][0]["lastPr"])
 
-            # 2. Fetch Recent 15m Candlesticks for RSI (productType=SPOT required)
-            kline_url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={clean_symbol}&granularity=15m&limit=30&productType=SPOT"
+            # 2. Fetch Candlestick Data for RSI
+            kline_url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={clean_symbol}&granularity=15m&limit=30"
             kline_res = await client.get(kline_url)
             kline_data = kline_res.json()
 
@@ -91,7 +144,6 @@ async def fetch_market_data(symbol: str, mode: str):
                 closes = [float(candle[4]) for candle in kline_data["data"]]
                 closes.reverse()
 
-                # Calculate 14-period RSI
                 df = pd.DataFrame({"close": closes})
                 delta = df["close"].diff()
                 gain = delta.clip(lower=0)
@@ -108,9 +160,8 @@ async def fetch_market_data(symbol: str, mode: str):
             return {"price": live_price, "rsi": round(current_rsi, 1)}
 
     except Exception as e:
-        logger.error(f"Bitget API Error for {symbol}: {e}")
+        logger.error(f"Bitget Market Data Error for {symbol}: {e}")
         return None
-        
 
 
 # ==========================================
@@ -182,9 +233,7 @@ def get_watchlist_keyboard():
             is_active = pair in USER_SETTINGS["WATCHLIST"]
             label = f"✅ {pair}" if is_active else f"➕ {pair}"
             row.append(
-                InlineKeyboardButton(
-                    label, callback_data=f"toggle_pair_{pair}"
-                )
+                InlineKeyboardButton(label, callback_data=f"toggle_pair_{pair}")
             )
         keyboard.append(row)
 
@@ -196,11 +245,7 @@ def get_watchlist_keyboard():
         ]
     )
     keyboard.append(
-        [
-            InlineKeyboardButton(
-                "🔙 Back to Main Menu", callback_data="main_menu"
-            )
-        ]
+        [InlineKeyboardButton("🔙 Back to Main Menu", callback_data="main_menu")]
     )
     return InlineKeyboardMarkup(keyboard)
 
@@ -211,21 +256,14 @@ def get_watchlist_keyboard():
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     USER_SETTINGS["WAITING_FOR_AMOUNT"] = False
     USER_SETTINGS["WAITING_FOR_CUSTOM_PAIR"] = False
-    welcome_text = (
-        "🤖 **Bitget Autonomous Trading Bot**\n\n"
-        "**Step 1:** Select execution mode:"
-    )
+    text = "🤖 **Bitget Autonomous Trading Bot**\n\nChoose execution mode to begin:"
     if update.message:
         await update.message.reply_text(
-            welcome_text,
-            reply_markup=get_mode_keyboard(),
-            parse_mode="Markdown",
+            text, reply_markup=get_mode_keyboard(), parse_mode="Markdown"
         )
     elif update.callback_query:
         await update.callback_query.message.reply_text(
-            welcome_text,
-            reply_markup=get_mode_keyboard(),
-            parse_mode="Markdown",
+            text, reply_markup=get_mode_keyboard(), parse_mode="Markdown"
         )
 
 
@@ -240,11 +278,11 @@ async def mode_selection_callback(
     USER_SETTINGS["WAITING_FOR_AMOUNT"] = True
 
     icon = "🟢" if mode == "DEMO" else "🔴"
-    prompt_text = (
+    prompt = (
         f"{icon} Mode set to **{mode}**.\n\n"
-        "**Step 2:** Enter trade size in USDT (e.g. 100):"
+        "**Enter trade allocation amount in USDT per order (e.g. 100):**"
     )
-    await query.message.reply_text(prompt_text, parse_mode="Markdown")
+    await query.message.reply_text(prompt, parse_mode="Markdown")
 
 
 async def text_input_handler(
@@ -285,19 +323,52 @@ async def text_input_handler(
 
             summary = (
                 "🎉 **Setup Complete!**\n\n"
-                f"• Mode: {USER_SETTINGS['TRADING_MODE']}\n"
-                f"• Allocation: ${amount:,.2f} USDT\n"
-                f"• Pairs: {', '.join(USER_SETTINGS['WATCHLIST'])}"
+                f"• Execution Mode: **{USER_SETTINGS['TRADING_MODE']}**\n"
+                f"• Allocation: **${amount:,.2f} USDT**\n"
+                f"• Active Watchlist: {', '.join(USER_SETTINGS['WATCHLIST'])}"
             )
             await update.message.reply_text(
-                summary,
-                reply_markup=get_main_keyboard(),
-                parse_mode="Markdown",
+                summary, reply_markup=get_main_keyboard(), parse_mode="Markdown"
             )
         except ValueError:
-            await update.message.reply_text(
-                "⚠️ Enter a valid number (e.g. 100):"
+            await update.message.reply_text("⚠️ Enter a valid number (e.g. 100):")
+
+
+async def check_balance_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer("Checking account balance...")
+
+    mode = USER_SETTINGS["TRADING_MODE"]
+
+    if mode == "DEMO":
+        bal = USER_SETTINGS["DEMO_BALANCE"]
+        msg = (
+            "💰 **ACCOUNT BALANCE (DEMO MODE)**\n"
+            "───────────────\n"
+            f"• Available Paper Balance: **${bal:,.2f} USDT**\n"
+            f"• Realized PnL: **${USER_SETTINGS['REALIZED_PNL']:+.2f} USDT**"
+        )
+    else:
+        live_bal = await fetch_real_balance("LIVE")
+        if live_bal is not None:
+            msg = (
+                "💰 **BITGET LIVE ACCOUNT BALANCE**\n"
+                "───────────────\n"
+                f"• Available Real Balance: **${live_bal:,.2f} USDT**\n"
+                "• Status: **Connected to Bitget API**"
             )
+        else:
+            msg = (
+                "💰 **ACCOUNT BALANCE (LIVE MODE)**\n"
+                "───────────────\n"
+                "⚠️ **Failed to retrieve Bitget balance.** Check your internet connection or API credentials."
+            )
+
+    await query.message.reply_text(
+        msg, reply_markup=get_main_keyboard(), parse_mode="Markdown"
+    )
 
 
 async def check_pnl_callback(
@@ -310,7 +381,10 @@ async def check_pnl_callback(
     positions = USER_SETTINGS["OPEN_POSITIONS"]
 
     total_unrealized_pnl = 0.0
-    pnl_lines = ["📈 **PROFIT & LOSS (PnL) REPORT**", f"Mode: **{mode}**\n"]
+    pnl_lines = [
+        "📈 **PROFIT & LOSS (PnL) REPORT**",
+        f"Mode: **{mode}**\n",
+    ]
 
     if not positions:
         pnl_lines.append("ℹ️ No active open positions.")
@@ -337,7 +411,7 @@ async def check_pnl_callback(
         f"\n{total_icon} **Unrealized PnL**: **${total_unrealized_pnl:+.2f} USDT**"
     )
     pnl_lines.append(
-        f"💰 **Realized Profit**: **${USER_SETTINGS['REALIZED_PNL']:+.2f} USDT**"
+        f"💰 **Realized PnL**: **${USER_SETTINGS['REALIZED_PNL']:+.2f} USDT**"
     )
 
     await query.message.reply_text(
@@ -347,34 +421,11 @@ async def check_pnl_callback(
     )
 
 
-async def check_balance_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-):
-    query = update.callback_query
-    await query.answer("Checking account balance...")
-
-    mode = USER_SETTINGS["TRADING_MODE"]
-    bal = USER_SETTINGS["BALANCE"]
-    realized = USER_SETTINGS["REALIZED_PNL"]
-
-    msg = (
-        "💰 **ACCOUNT BALANCE**\n"
-        "───────────────\n"
-        f"• Environment: **{mode}**\n"
-        f"• Available USDT: **${bal:,.2f} USDT**\n"
-        f"• Realized Earnings: **${realized:+.2f} USDT**\n"
-        f"• Total Equity: **${(bal + realized):,.2f} USDT**"
-    )
-    await query.message.reply_text(
-        msg, reply_markup=get_main_keyboard(), parse_mode="Markdown"
-    )
-
-
 async def check_market_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     query = update.callback_query
-    await query.answer("Fetching signals...")
+    await query.answer("Fetching live market signals...")
 
     if not USER_SETTINGS["WATCHLIST"]:
         await query.message.reply_text(
@@ -384,41 +435,30 @@ async def check_market_callback(
 
     mode = USER_SETTINGS["TRADING_MODE"]
     status_msg = await query.message.reply_text(
-        f"⏳ Fetching indicators ({mode} Mode)..."
+        f"⏳ Fetching live market data ({mode} Mode)..."
     )
 
-    try:
-        lines = ["📊 **MARKET ANALYSIS**\n"]
-        for pair in USER_SETTINGS["WATCHLIST"]:
-            data = await fetch_market_data(pair, mode)
-            if data:
-                rsi = data["rsi"]
-                signal = (
-                    "🟢 BUY"
-                    if rsi < RSI_BUY_THRESHOLD
-                    else (
-                        "🔴 SELL"
-                        if rsi > RSI_SELL_THRESHOLD
-                        else "⚪ Hold"
-                    )
-                )
-                lines.append(
-                    f"• **{pair}**: ${data['price']:,.2f} | RSI: {rsi:.1f} ({signal})"
-                )
-            else:
-                lines.append(f"• **{pair}**: ⚠️ Error")
+    lines = ["📊 **LIVE MARKET ANALYSIS**\n"]
+    for pair in USER_SETTINGS["WATCHLIST"]:
+        data = await fetch_market_data(pair, mode)
+        if data:
+            rsi = data["rsi"]
+            signal = (
+                "🟢 BUY"
+                if rsi < RSI_BUY_THRESHOLD
+                else ("🔴 SELL" if rsi > RSI_SELL_THRESHOLD else "⚪ Hold")
+            )
+            lines.append(
+                f"• **{pair}**: ${data['price']:,.2f} | RSI: {rsi:.1f} ({signal})"
+            )
+        else:
+            lines.append(f"• **{pair}**: ⚠️ Bitget API Error")
 
-        await status_msg.edit_text(
-            "\n".join(lines),
-            reply_markup=get_main_keyboard(),
-            parse_mode="Markdown",
-        )
-    except Exception as e:
-        logger.error(f"Error in check_market: {e}")
-        await status_msg.edit_text(
-            "⚠️ Network timeout fetching data.",
-            reply_markup=get_main_keyboard(),
-        )
+    await status_msg.edit_text(
+        "\n".join(lines),
+        reply_markup=get_main_keyboard(),
+        parse_mode="Markdown",
+    )
 
 
 async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -441,7 +481,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else "None"
         )
         await query.message.reply_text(
-            f"🎯 **WATCHLIST**\nActive: **{pairs_str}**",
+            f"🎯 **WATCHLIST MANAGEMENT**\nActive Pairs: **{pairs_str}**",
             reply_markup=get_watchlist_keyboard(),
             parse_mode="Markdown",
         )
@@ -458,7 +498,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else "None"
         )
         await query.message.edit_text(
-            f"🎯 **WATCHLIST**\nActive: **{pairs_str}**",
+            f"🎯 **WATCHLIST MANAGEMENT**\nActive Pairs: **{pairs_str}**",
             reply_markup=get_watchlist_keyboard(),
             parse_mode="Markdown",
         )
@@ -466,30 +506,33 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "add_custom_pair":
         USER_SETTINGS["WAITING_FOR_CUSTOM_PAIR"] = True
         await query.message.reply_text(
-            "✏️ Enter pair ticker (e.g., `PEPE/USDT`):", parse_mode="Markdown"
+            "✏️ Enter custom pair ticker (e.g. `PEPE/USDT` or `SOL`):",
+            parse_mode="Markdown",
         )
 
     elif data == "trigger_set_amount":
         USER_SETTINGS["WAITING_FOR_AMOUNT"] = True
-        await query.message.reply_text("Enter allocation amount in USDT:")
+        await query.message.reply_text("Enter allocation size in USDT:")
 
     elif data == "bot_status":
         status_text = (
-            "⚙️ **BOT STATUS**\n"
-            f"Mode: {USER_SETTINGS['TRADING_MODE']}\n"
-            f"Allocation: ${USER_SETTINGS['ALLOCATION_PER_ORDER']:.2f} USDT\n"
-            f"Watchlist: {', '.join(USER_SETTINGS['WATCHLIST']) if USER_SETTINGS['WATCHLIST'] else 'None'}"
+            "⚙️ **BOT STATUS REPORT**\n"
+            "───────────────\n"
+            f"• Mode: **{USER_SETTINGS['TRADING_MODE']}**\n"
+            f"• Trade Allocation: **${USER_SETTINGS['ALLOCATION_PER_ORDER']:.2f} USDT**\n"
+            f"• Active Watchlist: {', '.join(USER_SETTINGS['WATCHLIST'])}"
         )
         await query.message.reply_text(
-            status_text,
-            reply_markup=get_main_keyboard(),
-            parse_mode="Markdown",
+            status_text, reply_markup=get_main_keyboard(), parse_mode="Markdown"
         )
 
     elif data == "strategy_rules":
         rules = (
-            f"📖 **RULES**\n1. Buy: RSI < {RSI_BUY_THRESHOLD}\n2. Sell: RSI >"
-            f" {RSI_SELL_THRESHOLD}"
+            "📖 **STRATEGY RULES**\n"
+            "───────────────\n"
+            f"1. **Buy Trigger**: RSI (15m) < **{RSI_BUY_THRESHOLD}**\n"
+            f"2. **Sell Trigger**: RSI (15m) > **{RSI_SELL_THRESHOLD}**\n"
+            "3. **Position Sizing**: Fixed USDT allocation per trade."
         )
         await query.message.reply_text(
             rules, reply_markup=get_main_keyboard(), parse_mode="Markdown"
@@ -497,7 +540,7 @@ async def button_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ==========================================
-# MAIN INITIALIZATION
+# MAIN EXECUTION
 # ==========================================
 def main():
     request = HTTPXRequest(connect_timeout=30.0, read_timeout=30.0)
@@ -513,9 +556,7 @@ def main():
         CallbackQueryHandler(check_pnl_callback, pattern="^check_pnl$")
     )
     app.add_handler(
-        CallbackQueryHandler(
-            check_balance_callback, pattern="^check_balance$"
-        )
+        CallbackQueryHandler(check_balance_callback, pattern="^check_balance$")
     )
     app.add_handler(
         CallbackQueryHandler(check_market_callback, pattern="^check_market$")
@@ -525,10 +566,10 @@ def main():
         MessageHandler(filters.TEXT & ~filters.COMMAND, text_input_handler)
     )
 
-    logger.info("Bot started successfully.")
+    logger.info("Bot starting...")
     app.run_polling(drop_pending_updates=True)
 
 
 if __name__ == "__main__":
     main()
-                
+            
