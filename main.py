@@ -28,17 +28,13 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = "7739259104:AAEKKWPy2LZfCQC1Lm6lOEpQJ_cVXPEfU4c"
 
-# API Credentials
-DEMO_API_KEY = "bg_4e1491afbd7a021134eef2e8d5c2c4c5"
-DEMO_SECRET_KEY = (
-    "b9dde440fa3492ed888ad325e4c6b9ee7e0856cf974c0caa9bba339a748e3f23"
-)
-
+# Bitget Live API Credentials
 LIVE_API_KEY = "bg_203aa8f162f1ab5302705d5711745dcc"
 LIVE_SECRET_KEY = (
     "1ea94d15af0aa29174e3b712fbd6f97e5136fe344f8c1fadb5454497873b50df"
 )
-LIVE_PASSPHRASE = ""  # Add Bitget passphrase if your API key requires one
+# REQUIRED FOR LIVE BALANCE: Enter the Passphrase you created on Bitget for this API Key
+LIVE_PASSPHRASE = "224422"
 
 USER_SETTINGS = {
     "TRADING_MODE": "DEMO",
@@ -68,12 +64,12 @@ RSI_SELL_THRESHOLD = 55.0
 
 
 # ==========================================
-# BITGET API & SIGNATURE HELPERS
+# BITGET API HELPERS
 # ==========================================
 def generate_signature(
     timestamp: str, method: str, request_path: str, body: str, secret_key: str
 ) -> str:
-    """Generates HMAC-SHA256 signature required for Bitget v2 private API."""
+    """Generates HMAC-SHA256 signature for Bitget V2 API."""
     message = f"{timestamp}{method.upper()}{request_path}{body}"
     mac = hmac.new(
         secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256
@@ -81,22 +77,30 @@ def generate_signature(
     return base64.b64encode(mac.digest()).decode("utf-8")
 
 
-async def fetch_real_balance(mode: str):
-    """Fetches real available USDT balance from Bitget Account API."""
-    api_key = LIVE_API_KEY if mode == "LIVE" else DEMO_API_KEY
-    secret_key = LIVE_SECRET_KEY if mode == "LIVE" else DEMO_SECRET_KEY
+async def fetch_real_balance():
+    """Fetches real available USDT spot balance from Bitget."""
+    if (
+        not LIVE_PASSPHRASE
+        or LIVE_PASSPHRASE == "YOUR_BITGET_PASSPHRASE_HERE"
+    ):
+        logger.error(
+            "Bitget Passphrase missing! Please update LIVE_PASSPHRASE in main.py"
+        )
+        return None
 
     request_path = "/api/v2/spot/account/assets"
     timestamp = str(int(time.time() * 1000))
-    signature = generate_signature(timestamp, "GET", request_path, "", secret_key)
+    signature = generate_signature(
+        timestamp, "GET", request_path, "", LIVE_SECRET_KEY
+    )
 
     headers = {
-        "ACCESS-KEY": api_key,
+        "ACCESS-KEY": LIVE_API_KEY,
         "ACCESS-SIGN": signature,
         "ACCESS-TIMESTAMP": timestamp,
         "ACCESS-PASSPHRASE": LIVE_PASSPHRASE,
         "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0",
+        "locale": "en-US",
     }
 
     try:
@@ -109,20 +113,25 @@ async def fetch_real_balance(mode: str):
                 for asset in data["data"]:
                     if asset.get("coin") == "USDT":
                         return float(asset.get("available", 0.0))
-            return 0.0
+                return 0.0
+            else:
+                logger.error(f"Bitget Balance Response Error: {data}")
+                return None
     except Exception as e:
-        logger.error(f"Error fetching Bitget balance ({mode}): {e}")
+        logger.error(f"Error fetching Bitget balance: {e}")
         return None
 
 
-async def fetch_market_data(symbol: str, mode: str):
-    """Fetches real-time price and 15m RSI for both Live and Demo modes."""
+async def fetch_market_data(symbol: str):
+    """Fetches price ticker and calculates 15m RSI using public Bitget REST endpoints."""
     try:
         clean_symbol = symbol.replace("/", "").upper()
-        headers = {"User-Agent": "Mozilla/5.0"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+        }
 
         async with httpx.AsyncClient(timeout=10.0, headers=headers) as client:
-            # 1. Fetch Real-time Price Ticker
+            # 1. Fetch Real-time Spot Ticker
             ticker_url = f"https://api.bitget.com/api/v2/spot/market/tickers?symbol={clean_symbol}"
             ticker_res = await client.get(ticker_url)
             ticker_data = ticker_res.json()
@@ -131,11 +140,14 @@ async def fetch_market_data(symbol: str, mode: str):
                 ticker_data.get("code") != "00000"
                 or not ticker_data.get("data")
             ):
+                logger.error(
+                    f"Ticker API error for {clean_symbol}: {ticker_data}"
+                )
                 return None
 
             live_price = float(ticker_data["data"][0]["lastPr"])
 
-            # 2. Fetch Candlestick Data for RSI
+            # 2. Fetch Candlesticks (15m Granularity)
             kline_url = f"https://api.bitget.com/api/v2/spot/market/candles?symbol={clean_symbol}&granularity=15m&limit=30"
             kline_res = await client.get(kline_url)
             kline_data = kline_res.json()
@@ -351,19 +363,20 @@ async def check_balance_callback(
             f"• Realized PnL: **${USER_SETTINGS['REALIZED_PNL']:+.2f} USDT**"
         )
     else:
-        live_bal = await fetch_real_balance("LIVE")
+        live_bal = await fetch_real_balance()
         if live_bal is not None:
             msg = (
                 "💰 **BITGET LIVE ACCOUNT BALANCE**\n"
                 "───────────────\n"
-                f"• Available Real Balance: **${live_bal:,.2f} USDT**\n"
+                f"• Available Spot USDT: **${live_bal:,.2f} USDT**\n"
                 "• Status: **Connected to Bitget API**"
             )
         else:
             msg = (
                 "💰 **ACCOUNT BALANCE (LIVE MODE)**\n"
                 "───────────────\n"
-                "⚠️ **Failed to retrieve Bitget balance.** Check your internet connection or API credentials."
+                "⚠️ **Failed to retrieve Bitget balance.**\n\n"
+                "Ensure you set `LIVE_PASSPHRASE` in `main.py` to the passphrase created for your API Key."
             )
 
     await query.message.reply_text(
@@ -390,7 +403,7 @@ async def check_pnl_callback(
         pnl_lines.append("ℹ️ No active open positions.")
     else:
         for pair, pos in positions.items():
-            m_data = await fetch_market_data(pair, mode)
+            m_data = await fetch_market_data(pair)
             if m_data:
                 curr_price = m_data["price"]
                 entry_price = pos["entry_price"]
@@ -440,7 +453,7 @@ async def check_market_callback(
 
     lines = ["📊 **LIVE MARKET ANALYSIS**\n"]
     for pair in USER_SETTINGS["WATCHLIST"]:
-        data = await fetch_market_data(pair, mode)
+        data = await fetch_market_data(pair)
         if data:
             rsi = data["rsi"]
             signal = (
@@ -572,4 +585,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-            
+        
